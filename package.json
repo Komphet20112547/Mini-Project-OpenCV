@@ -6,10 +6,12 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "postinstall": "node scripts/copy-ort-wasm.mjs",
     "lint": "eslint"
   },
   "dependencies": {
     "next": "16.1.1",
+    "onnxruntime-web": "^1.23.2",
     "react": "19.2.3",
     "react-dom": "19.2.3"
   },
