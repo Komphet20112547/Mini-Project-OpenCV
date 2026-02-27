@@ -19,15 +19,62 @@ const emotionTranslations: Record<string, string> = {
   surprise: "ประหลาดใจ",
 };
 
+// อิโมจิสำหรับอารมณ์แต่ละแบบ
+const emotionEmojis: Record<string, string> = {
+  angry: "😡",
+  disgust: "🤢",
+  fear: "😱",
+  happy: "😄",
+  neutral: "😐",
+  sad: "😢",
+  surprise: "😲",
+};
+
+type Difficulty = "easy" | "medium" | "hard";
+
+function getRulesForDifficulty(difficulty: Difficulty) {
+  switch (difficulty) {
+    case "medium":
+      return {
+        winThreshold: 5,
+        loseThreshold: -3,
+        wrongPenalty: 2,
+      };
+    case "hard":
+      return {
+        winThreshold: 7,
+        loseThreshold: -2,
+        wrongPenalty: 3,
+      };
+    case "easy":
+    default:
+      return {
+        winThreshold: 3,
+        loseThreshold: -5,
+        wrongPenalty: 1,
+      };
+  }
+}
+
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const bgmRef = useRef<HTMLAudioElement | null>(null);
+  const correctSfxRef = useRef<HTMLAudioElement | null>(null);
+  const wrongSfxRef = useRef<HTMLAudioElement | null>(null);
+  const winSfxRef = useRef<HTMLAudioElement | null>(null);
+  const loseSfxRef = useRef<HTMLAudioElement | null>(null);
   const [status, setStatus] = useState<string>(
     "พร้อม เริ่มกดปุ่ม Start",
   );
   const [emotion, setEmotion] = useState<EmotionResult | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [score, setScore] = useState(0);
+  const [gameStatus, setGameStatus] = useState<"playing" | "won" | "lost" | null>(null);
+  const [difficulty, setDifficulty] = useState<Difficulty>("easy");
+  const [currentTarget, setCurrentTarget] = useState<string | null>(null);
+  const [timeLeft, setTimeLeft] = useState(4);
   const processingIntervalRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
   const isInferBusyRef = useRef(false);
@@ -48,6 +95,10 @@ export default function Home() {
     size64?: any;
   }>({});
   const floatInputRef = useRef<Float32Array | null>(null);
+  const gameRoundIntervalRef = useRef<number | null>(null);
+  const gameCountdownIntervalRef = useRef<number | null>(null);
+  const lastPredLabelRef = useRef<string | null>(null);
+  const currentTargetRef = useRef<string | null>(null);
 
   // Load OpenCV script dynamically
   const loadOpenCV = useCallback(async () => {
@@ -100,6 +151,8 @@ export default function Home() {
     const labels = (await labelsRes.json()) as string[];
     labelsRef.current = labels;
 
+    // Reduce noisy runtime logs (e.g. Unknown CPU vendor) so they don't show as dev overlay errors
+    ort.env.logLevel = "error";
     // Deterministic WASM asset loading (we'll copy wasm files into /public/ort in postinstall)
     ort.env.wasm.wasmPaths = "/ort/";
     // Keep it stable across devices; threaded wasm can be flaky depending on COOP/COEP headers
@@ -166,9 +219,28 @@ export default function Home() {
     }
     isInferBusyRef.current = false;
   }, []);
+  const stopGame = useCallback(() => {
+    if (gameRoundIntervalRef.current) {
+      window.clearInterval(gameRoundIntervalRef.current);
+      gameRoundIntervalRef.current = null;
+    }
+    if (gameCountdownIntervalRef.current) {
+      window.clearInterval(gameCountdownIntervalRef.current);
+      gameCountdownIntervalRef.current = null;
+    }
+    currentTargetRef.current = null;
+    lastPredLabelRef.current = null;
+    setCurrentTarget(null);
+    setTimeLeft(4);
+    if (bgmRef.current) {
+      bgmRef.current.pause();
+      bgmRef.current.currentTime = 0;
+    }
+  }, []);
 
   const stopCamera = useCallback(() => {
     stopProcessing();
+    stopGame();
     const video = videoRef.current;
     if (video && video.srcObject) {
       const stream = video.srcObject as MediaStream;
@@ -186,7 +258,7 @@ export default function Home() {
     });
     cvMatsRef.current = {};
     setIsRunning(false);
-  }, [stopProcessing]);
+  }, [stopGame, stopProcessing]);
 
   const softmaxTop1 = useCallback(
     (scores: Float32Array) => {
@@ -212,6 +284,123 @@ export default function Home() {
     },
     [],
   );
+
+  const startGame = useCallback(() => {
+    const rules = getRulesForDifficulty(difficulty);
+    const labelsForGame =
+      labelsRef.current && labelsRef.current.length > 0
+        ? labelsRef.current
+        : Object.keys(emotionTranslations);
+
+    if (!labelsForGame || labelsForGame.length === 0) return;
+
+    if (gameRoundIntervalRef.current) {
+      window.clearInterval(gameRoundIntervalRef.current);
+    }
+    if (gameCountdownIntervalRef.current) {
+      window.clearInterval(gameCountdownIntervalRef.current);
+    }
+
+    setScore(0);
+    setGameStatus("playing");
+
+    if (bgmRef.current) {
+      try {
+        bgmRef.current.currentTime = 0;
+        // eslint-disable-next-line @typescript-eslint/no-floating-promises
+        bgmRef.current.play();
+      } catch {
+        // ignore autoplay rejection
+      }
+    }
+
+    const pickNewTarget = () => {
+      // เพิ่มน้ำหนักให้ happy, angry, neutral ออกบ่อยกว่าปกติ
+      const weighted: string[] = [];
+      const weightMap: Record<string, number> = {
+        happy: 4,
+        angry: 3,
+        neutral: 3,
+      };
+
+      labelsForGame.forEach((label) => {
+        const w = weightMap[label] ?? 1;
+        for (let i = 0; i < w; i++) {
+          weighted.push(label);
+        }
+      });
+
+      const pool = weighted.length > 0 ? weighted : labelsForGame;
+      const idx = Math.floor(Math.random() * pool.length);
+      const target = pool[idx];
+      currentTargetRef.current = target;
+      setCurrentTarget(target);
+    };
+
+    pickNewTarget();
+    setTimeLeft(4);
+
+    gameCountdownIntervalRef.current = window.setInterval(() => {
+      setTimeLeft((prev) => (prev > 0 ? prev - 1 : 0));
+    }, 1000);
+
+    gameRoundIntervalRef.current = window.setInterval(() => {
+      const target = currentTargetRef.current;
+      const predicted = lastPredLabelRef.current;
+
+      if (target) {
+        setScore((prev) => {
+          const isCorrect = predicted && predicted === target;
+          const nextScore = isCorrect ? prev + 1 : prev - rules.wrongPenalty;
+
+          // เล่นเสียงตามสถานะรอบนี้ ตามระดับความยาก
+          if (nextScore >= rules.winThreshold) {
+            const winSfx = winSfxRef.current ?? correctSfxRef.current;
+            if (winSfx) {
+              try {
+                winSfx.currentTime = 0;
+                // eslint-disable-next-line @typescript-eslint/no-floating-promises
+                winSfx.play();
+              } catch {
+                // ignore autoplay rejection
+              }
+            }
+            setGameStatus("won");
+            stopGame();
+          } else if (nextScore <= rules.loseThreshold) {
+            const loseSfx = loseSfxRef.current ?? wrongSfxRef.current;
+            if (loseSfx) {
+              try {
+                loseSfx.currentTime = 0;
+                // eslint-disable-next-line @typescript-eslint/no-floating-promises
+                loseSfx.play();
+              } catch {
+                // ignore autoplay rejection
+              }
+            }
+            setGameStatus("lost");
+            stopGame();
+          } else {
+            const sfx = isCorrect ? correctSfxRef.current : wrongSfxRef.current;
+            if (sfx) {
+              try {
+                sfx.currentTime = 0;
+                // eslint-disable-next-line @typescript-eslint/no-floating-promises
+                sfx.play();
+              } catch {
+                // ignore autoplay rejection
+              }
+            }
+          }
+
+          return nextScore;
+        });
+      }
+
+      pickNewTarget();
+      setTimeLeft(4);
+    }, 4000);
+  }, [difficulty, stopGame]);
 
   const startCamera = useCallback(async () => {
     try {
@@ -363,8 +552,10 @@ export default function Home() {
               }
               
               const { bestIdx, bestP } = softmaxTop1(scores);
+              const predictedLabel = labels[bestIdx] ?? "unknown";
+              lastPredLabelRef.current = predictedLabel;
               setEmotion({
-                label: labels[bestIdx] ?? "unknown",
+                label: predictedLabel,
                 confidence: bestP * 100,
               });
             } catch (inferErr) {
@@ -396,6 +587,9 @@ export default function Home() {
         // eslint-disable-next-line @typescript-eslint/no-floating-promises
         loop(t);
       });
+
+      // เริ่มเกมจับอารมณ์ตามอิโมจิเมื่อกล้องพร้อมแล้ว
+      startGame();
     } catch (err: unknown) {
       console.error(err);
       setErrorMessage(
@@ -406,13 +600,25 @@ export default function Home() {
     } finally {
       setIsLoading(false);
     }
-  }, [loadCascade, loadModel, loadOpenCV, softmaxTop1, stopCamera]);
+  }, [loadCascade, loadModel, loadOpenCV, softmaxTop1, startGame, stopCamera]);
 
   useEffect(() => {
     return () => {
       stopCamera();
     };
   }, [stopCamera]);
+
+  const targetLabel = currentTarget;
+  const targetEmoji =
+    targetLabel && emotionEmojis[targetLabel]
+      ? emotionEmojis[targetLabel]
+      : "❔";
+  const targetText =
+    targetLabel && emotionTranslations[targetLabel]
+      ? `${emotionTranslations[targetLabel]} (${targetLabel})`
+      : "-";
+
+  const currentRules = getRulesForDifficulty(difficulty);
 
   return (
     <div className="flex min-h-screen flex-col items-center justify-center bg-gradient-to-br from-amber-50 via-orange-50 to-amber-100 px-4 py-8 font-sans">
@@ -454,15 +660,49 @@ export default function Home() {
             </span>
           </div>
 
-          {/* Status and Emotion Display */}
-          <div className="mb-4 rounded-lg bg-white/60 p-4 shadow-inner backdrop-blur-sm">
-            <div className="mb-3 space-y-2 text-sm">
+          {/* Status, Emotion, Difficulty, and Game HUD */}
+          <div className="mb-4 space-y-3 rounded-lg bg-white/60 p-4 shadow-inner backdrop-blur-sm">
+            <div className="space-y-2 text-sm">
               <div className="flex items-center gap-2">
                 <span className="font-semibold text-amber-800">สถานะ:</span>
                 <span className="text-amber-900">{status}</span>
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <span className="font-semibold text-amber-800">อารมณ์:</span>
+                <span className="font-semibold text-amber-800">
+                  ระดับความยาก:
+                </span>
+                <div className="inline-flex overflow-hidden rounded-lg border border-amber-300 bg-amber-100/80 text-xs font-semibold text-amber-900 shadow-sm">
+                  {(["easy", "medium", "hard"] as Difficulty[]).map((lvl) => (
+                    <button
+                      key={lvl}
+                      type="button"
+                      disabled={isRunning}
+                      onClick={() => setDifficulty(lvl)}
+                      className={`px-2 py-1 transition-colors ${
+                        difficulty === lvl
+                          ? "bg-amber-600 text-white"
+                          : "bg-transparent hover:bg-amber-200/80"
+                      } ${lvl !== "hard" ? "border-r border-amber-300" : ""} disabled:opacity-50 disabled:hover:bg-transparent`}
+                    >
+                      {lvl === "easy"
+                        ? "ง่าย"
+                        : lvl === "medium"
+                          ? "ปานกลาง"
+                          : "ยาก"}
+                    </button>
+                  ))}
+                </div>
+                <span className="text-[10px] text-amber-700">
+                  {difficulty === "easy" &&
+                    "ชนะที่ 3 แต้ม, แพ้ที่ -5, ผิด -1 แต้ม"}
+                  {difficulty === "medium" &&
+                    "ชนะที่ 5 แต้ม, แพ้ที่ -3, ผิด -2 แต้ม"}
+                  {difficulty === "hard" &&
+                    "ชนะที่ 7 แต้ม, แพ้ที่ -2, ผิด -3 แต้ม"}
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-semibold text-amber-800">อารมณ์ปัจจุบัน:</span>
                 <span className="rounded-md bg-amber-200 px-3 py-1 font-bold text-amber-900 shadow-sm">
                   {emotion
                     ? `${emotionTranslations[emotion.label] ?? emotion.label} (${emotion.label})`
@@ -477,8 +717,51 @@ export default function Home() {
                 </span>
               </div>
             </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-md bg-amber-100/70 px-3 py-2 text-sm">
+              <div className="flex items-center gap-2">
+                <span className="text-lg sm:text-2xl">{targetEmoji}</span>
+                <div className="flex flex-col">
+                  <span className="text-xs font-semibold text-amber-700">
+                    เป้าหมาย (ทำหน้าตามอิโมจิ)
+                  </span>
+                  <span className="text-sm font-bold text-amber-900">
+                    {targetText}
+                  </span>
+                </div>
+              </div>
+              <div className="flex items-center gap-4">
+                <div className="flex flex-col items-start">
+                  <span className="text-xs font-semibold text-amber-700">
+                    เวลาที่เหลือในรอบนี้
+                  </span>
+                  <span className="text-sm font-bold text-amber-900">
+                    {timeLeft}s
+                  </span>
+                </div>
+                <div className="flex flex-col items-start">
+                  <span className="text-xs font-semibold text-amber-700">
+                    คะแนน
+                  </span>
+                  <span className="text-sm font-bold text-amber-900">
+                    {score}
+                  </span>
+                </div>
+              </div>
+              {gameStatus === "won" && (
+                <div className="mt-2 rounded-md bg-emerald-100 px-3 py-1 text-xs font-semibold text-emerald-800">
+                  Won! 🎉 คุณทำได้ถึง {currentRules.winThreshold} คะแนนแล้ว
+                </div>
+              )}
+              {gameStatus === "lost" && (
+                <div className="mt-2 rounded-md bg-red-100 px-3 py-1 text-xs font-semibold text-red-800">
+                  Game Over 😵 คะแนนลงถึง {currentRules.loseThreshold} แล้ว
+                </div>
+              )}
+            </div>
+
             {errorMessage && (
-              <div className="mt-2 rounded-md bg-red-100 border border-red-300 p-2">
+              <div className="mt-1 rounded-md border border-red-300 bg-red-100 p-2">
                 <p className="text-xs font-medium text-red-700">
                   {errorMessage}
                 </p>
@@ -546,6 +829,34 @@ export default function Home() {
               💡 หมายเหตุ: ต้องกดปุ่ม Start เพื่อขอสิทธิ์เปิดกล้อง
             </p>
           </div>
+
+          {/* Audio elements for background music and sound effects */}
+          <audio
+            ref={bgmRef}
+            src="/sounds/BG Sound.wav"
+            loop
+            className="hidden"
+          />
+          <audio
+            ref={correctSfxRef}
+            src="/sounds/Correct Sound.mp3"
+            className="hidden"
+          />
+          <audio
+            ref={wrongSfxRef}
+            src="/sounds/Correct Sound.mp3"
+            className="hidden"
+          />
+          <audio
+            ref={winSfxRef}
+            src="/sounds/Win Sound.wav"
+            className="hidden"
+          />
+          <audio
+            ref={loseSfxRef}
+            src="/sounds/Game Over Sound.wav"
+            className="hidden"
+          />
         </section>
       </main>
     </div>
